@@ -13,6 +13,7 @@ from click.testing import CliRunner
 from pyspector._rust_core import Issue, Severity, run_scan
 from pyspector.ast_cache import IncrementalAstCache
 from pyspector.cli import cli
+from pyspector.messages import handle_msg_flag
 from pyspector.reporting import Reporter
 from pyspector.triage import create_fingerprint
 
@@ -38,6 +39,8 @@ class TestRelativePaths(unittest.TestCase):
         )
         self.runner = CliRunner()
         self.addCleanup(patch.stopall)
+        self.preferences = self.root / ".pyspector" / "preferences.json"
+        patch("pyspector.messages._preferences_path", return_value=self.preferences).start()
         patch("pyspector.cli._print_banner").start()
         patch("pyspector.cli.handle_msg_flag").start()
         patch("pyspector.cli.get_cache", return_value=IncrementalAstCache()).start()
@@ -54,6 +57,7 @@ class TestRelativePaths(unittest.TestCase):
         for level in ("group", "scan"):
             for value, expected in cases:
                 with self.subTest(level=level, value=value):
+                    self.preferences.unlink(missing_ok=True)
                     args = ["scan", str(self.root)]
                     if value is not None:
                         args.insert(0 if level == "group" else 1, f"--relative-path={value}")
@@ -71,7 +75,8 @@ class TestRelativePaths(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 help_text = self.invoke([*prefix, "--help"])
                 self.assertIn("--relative-path BOOLEAN", help_text)
-                self.assertIn("[default: False]", help_text)
+                self.assertIn("No saved preference: False", " ".join(help_text.split()))
+                self.assertIn("persists across", " ".join(help_text.split()))
                 self.assertIn("file's parent", help_text)
                 result = self.runner.invoke(cli, [*prefix, "--relative-path=invalid"])
                 self.assertEqual(result.exit_code, 2)
@@ -94,7 +99,10 @@ class TestRelativePaths(unittest.TestCase):
             for remote in (False, True):
                 with self.subTest(wizard=wizard, remote=remote):
                     params["repo_url"] = "https://github.com/example/project" if remote else None
-                    args = ["scan", "--relative-path=True"]
+                    # The first scan saves True; subsequent modes must inherit it.
+                    args = ["scan"]
+                    if not wizard and not remote:
+                        args.append("--relative-path=True")
                     args += (
                         ["--wizard"]
                         if wizard
@@ -115,6 +123,7 @@ class TestRelativePaths(unittest.TestCase):
             (self.file, self.file.name),
         ):
             with self.subTest(target=target):
+                self.preferences.unlink(missing_ok=True)
                 reports, inputs = [], []
                 for option in (None, "False", "True"):
                     args = ["scan", str(target), "-f", "json"]
@@ -136,6 +145,134 @@ class TestRelativePaths(unittest.TestCase):
                         {k: v for k, v in relative.items() if k != "file_path"},
                     )
                     self.assertEqual(create_fingerprint(relative), create_fingerprint(absolute))
+
+    def test_preference_persists_across_invocations_and_targets(self):
+        other_project = self.root / "other-project"
+        other_project.mkdir()
+        other_file = other_project / "other.py"
+        other_file.write_text("eval(user_data)\n", encoding="utf-8")
+        for option, target, expected in (
+            (None, self.file, str(self.file)),
+            ("True", self.root, str(self.file.relative_to(self.root))),
+            (None, other_project, other_file.name),
+            (None, self.file, self.file.name),
+            ("False", other_project, str(other_file)),
+            (None, self.file, str(self.file)),
+        ):
+            with self.subTest(option=option, target=target):
+                args = ["scan", str(target), "-f", "json"]
+                if option is not None:
+                    args.append(f"--relative-path={option}")
+                issues = json.loads(self.invoke(args))["issues"]
+                self.assertTrue(issues)
+                self.assertIn(expected, [issue["file_path"] for issue in issues])
+
+    def test_saved_preference_and_option_precedence(self):
+        self.preferences.parent.mkdir()
+        for saved in (False, True):
+            for root in (None, False, True):
+                for scan in (None, False, True):
+                    with self.subTest(saved=saved, root=root, scan=scan):
+                        self.preferences.write_text(json.dumps({"relative_path": saved}))
+                        args = ["scan", str(self.root)]
+                        if root is not None:
+                            args.insert(0, f"--relative-path={root}")
+                        if scan is not None:
+                            args.append(f"--relative-path={scan}")
+                        expected = scan if scan is not None else root if root is not None else saved
+                        with patch("pyspector.cli._execute_scan") as execute:
+                            self.invoke(args)
+                        self.assertIs(execute.call_args.kwargs["relative_path"], expected)
+                        self.assertIs(
+                            json.loads(self.preferences.read_text())["relative_path"], expected
+                        )
+
+    def test_message_and_relative_preferences_preserve_each_other(self):
+        self.preferences.parent.mkdir()
+        extra = {"custom": {"value": "preserve"}}
+        self.preferences.write_text(json.dumps({"show_messages": False, **extra}))
+        with (
+            patch("pyspector.cli.handle_msg_flag", wraps=handle_msg_flag),
+            patch("pyspector.cli._execute_scan") as execute,
+        ):
+            self.assertNotIn(
+                "Contact Us", self.invoke(["scan", str(self.root), "--relative-path=True"])
+            )
+            self.assertEqual(
+                json.loads(self.preferences.read_text()),
+                {"show_messages": False, "relative_path": True, **extra},
+            )
+            self.assertIn("Contact Us", self.invoke(["--msg=True", "scan", str(self.root)]))
+            self.assertIs(execute.call_args.kwargs["relative_path"], True)
+            self.assertEqual(
+                json.loads(self.preferences.read_text()),
+                {"show_messages": True, "relative_path": True, **extra},
+            )
+            self.assertNotIn(
+                "Contact Us",
+                self.invoke(["scan", str(self.root), "--msg=False", "--relative-path=False"]),
+            )
+            self.assertEqual(
+                json.loads(self.preferences.read_text()),
+                {"show_messages": False, "relative_path": False, **extra},
+            )
+
+    def test_missing_or_malformed_preferences(self):
+        self.preferences.parent.mkdir()
+        for content in (None, "{invalid", "[]", "null", "true", '"text"', "42"):
+            with self.subTest(content=content):
+                self.preferences.unlink(missing_ok=True)
+                if content is not None:
+                    self.preferences.write_text(content)
+                with patch("pyspector.cli._execute_scan") as execute:
+                    self.invoke(["scan", str(self.root)])
+                    self.assertIs(execute.call_args.kwargs["relative_path"], False)
+                    if content is None:
+                        self.assertFalse(self.preferences.exists())
+                    else:
+                        self.assertEqual(self.preferences.read_text(), content)
+                    self.invoke(["scan", str(self.root), "--relative-path=True"])
+                    self.assertIs(execute.call_args.kwargs["relative_path"], True)
+                self.assertEqual(json.loads(self.preferences.read_text()), {"relative_path": True})
+
+    def test_unwritable_preferences_use_explicit_value_for_current_scan(self):
+        self.preferences.parent.mkdir()
+        for saved in (False, True):
+            for operation in ("mkdir", "open"):
+                with self.subTest(saved=saved, operation=operation):
+                    self.preferences.write_text(json.dumps({"relative_path": saved}))
+                    with (
+                        patch.object(Path, operation, side_effect=PermissionError("read only")),
+                        patch("pyspector.cli._execute_scan") as execute,
+                    ):
+                        self.invoke(["scan", str(self.root), f"--relative-path={not saved}"])
+                        self.assertIs(execute.call_args.kwargs["relative_path"], not saved)
+                    self.assertEqual(
+                        json.loads(self.preferences.read_text()), {"relative_path": saved}
+                    )
+                    with patch("pyspector.cli._execute_scan") as execute:
+                        self.invoke(["scan", str(self.root)])
+                    self.assertIs(execute.call_args.kwargs["relative_path"], saved)
+
+    def test_unreadable_preferences_fall_back_to_absolute(self):
+        self.preferences.parent.mkdir()
+        self.preferences.write_text('{"relative_path": true}')
+        with (
+            patch.object(Path, "open", side_effect=PermissionError("read only")),
+            patch("pyspector.cli._execute_scan") as execute,
+        ):
+            self.invoke(["scan", str(self.root)])
+        self.assertIs(execute.call_args.kwargs["relative_path"], False)
+
+    def test_help_and_unrelated_commands_do_not_update_preference(self):
+        self.preferences.parent.mkdir()
+        self.preferences.write_text('{"relative_path": true}')
+        for args in (["--relative-path=False", "scan", "--help"], ["watch", "--help"]):
+            with self.subTest(args=args):
+                output = self.invoke(args)
+                if args[0] == "watch":
+                    self.assertNotIn("--relative-path", output)
+                self.assertEqual(self.preferences.read_text(), '{"relative_path": true}')
 
     def test_report_formats_and_source_identity(self):
         fingerprint = self.issue.get_fingerprint()

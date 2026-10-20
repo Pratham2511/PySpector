@@ -20,7 +20,7 @@ from .config import load_config, get_default_rules
 from .reporting import Reporter
 from .triage import run_triage_tui
 from .stats import StatsCollector
-from .messages import handle_msg_flag
+from .messages import handle_msg_flag, relative_paths_enabled, set_relative_paths_enabled
 import requests
 from urllib.parse import urlparse
 
@@ -432,9 +432,11 @@ def _fmt_watch_issue(issue, tag: str, tag_color: str) -> str:
               help="Enable or disable the rotating contact message shown below the "
                    "banner (--msg=True / --msg=False). The setting persists across "
                    "future runs until changed again, so it only needs to be set once.")
-@click.option('--relative-path', type=bool, default=False, show_default=True,
+@click.option('--relative-path', type=bool, default=None,
               help="Show scan finding paths relative to the scanned directory or a "
-                   "single file's parent (--relative-path=True). False shows absolute paths.")
+                   "single file's parent (--relative-path=True). False shows absolute paths. "
+                   "The setting persists across runs until changed; omission uses the saved "
+                   "value. No saved preference: False.")
 @click.pass_context
 def cli(
     ctx: click.Context,
@@ -449,7 +451,7 @@ def cli(
     debug: bool,
     wizard: bool,
     show_msg: Optional[bool],
-    relative_path: bool,
+    relative_path: Optional[bool],
 ):
     """
     PySpector: A high-performance, security-focused static analysis tool
@@ -593,9 +595,11 @@ def run_wizard():
               help="Enable or disable the rotating contact message shown below the "
                    "banner (--msg=True / --msg=False). The setting persists across "
                    "future runs until changed again, so it only needs to be set once.")
-@click.option('--relative-path', type=bool, default=False, show_default=True,
+@click.option('--relative-path', type=bool, default=None,
               help="Show finding paths relative to the scanned directory or a "
-                   "single file's parent (--relative-path=True). False shows absolute paths.")
+                   "single file's parent (--relative-path=True). False shows absolute paths. "
+                   "The setting persists across runs until changed; omission uses the saved "
+                   "value. No saved preference: False.")
 def run_scan_command(
     path:             Optional[Path],
     repo_url:         Optional[str],
@@ -610,12 +614,17 @@ def run_scan_command(
     show_stats:       bool,
     debug:            bool,
     show_msg:         Optional[bool],
-    relative_path:    bool,
+    relative_path:    Optional[bool],
 ):
     """The main scan command with stats support."""
 
     _print_banner()
     handle_msg_flag(show_msg)
+
+    if relative_path is None:
+        relative_path = relative_paths_enabled()
+    else:
+        set_relative_paths_enabled(relative_path)
 
     # --- Wizard Mode ---
     if wizard:
